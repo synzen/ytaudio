@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -18,7 +19,7 @@ import (
 	"github.com/rylio/ytdl"
 )
 
-const (
+var (
 	ApiKey = ""
 )
 
@@ -71,51 +72,73 @@ type VideoComplete struct {
 	LikeRatio    float32
 }
 
-func getResponseBody(url string) []byte {
+func getResponseBody(url string) (body []byte, err error) {
 	resp, err := http.Get(url)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
+	} else if resp.StatusCode != 200 {
+		return nil, errors.New("Non-200 status code. Most likely invalid API key.")
 	}
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err = ioutil.ReadAll(resp.Body)
 	if err != nil {
 		log.Fatal(err)
 	}
-	return body
+	return body, nil
 }
 
-func search(term string) SearchResult {
+func search(term string) (ytResults SearchResult, err error) {
 	urlStr := "https://www.googleapis.com/youtube/v3/search?part=snippet&maxResults=10&type=video&q=" + url.QueryEscape(term) + "&key=" + ApiKey
-	body := getResponseBody(urlStr)
-	var ytResults SearchResult
+	body, err := getResponseBody(urlStr)
+	if err != nil {
+		return ytResults, err
+	}
 	jsonErr := json.Unmarshal(body, &ytResults)
 	if jsonErr != nil {
 		log.Fatal(jsonErr)
 	}
-	return ytResults
+	return ytResults, nil
 }
 
-func searchVideos(ids []string) VideoResult {
-	body := getResponseBody("https://www.googleapis.com/youtube/v3/videos?id=" + strings.Join(ids, ",") + "&part=contentDetails,statistics&key=AIzaSyBIehUHoPCo9DcbWV_iKQCUwR9KDQldwy0")
-	var result VideoResult
+func searchVideos(ids []string) (result VideoResult, err error) {
+	body, err := getResponseBody("https://www.googleapis.com/youtube/v3/videos?id=" + strings.Join(ids, ",") + "&part=contentDetails,statistics&key=" + ApiKey)
+	if err != nil {
+		return result, err
+	}
 	jsonErr := json.Unmarshal(body, &result)
 	if jsonErr != nil {
 		log.Fatal(jsonErr)
 	}
-	return result
+	return result, nil
 }
 
 func main() {
-	if len(ApiKey) == 0 {
-		fmt.Println("No API key found")
-		return
-	}
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	reader := bufio.NewReader(os.Stdin)
+	if len(ApiKey) == 0 {
+		fmt.Print("Enter API Key: ")
+		for {
+			apiKey, err := reader.ReadString('\n')
+			if err != nil {
+				log.Fatal(err)
+			}
+			apiKey = strings.TrimSpace(apiKey)
+			if len(apiKey) > 0 {
+				ApiKey = apiKey
+				break
+			} else {
+				fmt.Print("No input found, try again: ")
+			}
+		}
+	}
 	fmt.Print("Enter search query: ")
 	input, err := reader.ReadString('\n')
 	if err != nil {
 		log.Fatal(err)
 	}
-	searchResult := search(strings.TrimSpace(input))
+	searchResult, err := search(strings.TrimSpace(input))
+	if err != nil {
+		log.Fatal(err)
+	}
 	if len(searchResult.Items) == 0 {
 		fmt.Println("No videos found for that query.")
 		return
@@ -124,32 +147,55 @@ func main() {
 	for _, searchResultItem := range searchResult.Items {
 		videoIds = append(videoIds, searchResultItem.ID.VideoID)
 	}
-	videoResult := searchVideos(videoIds)
+	videoResult, err := searchVideos(videoIds)
+	if err != nil {
+		log.Fatal(err)
+	}
 	aggregated := make(map[string]VideoComplete)
 	for searchResultIndex, searchResultItem := range searchResult.Items {
 		videoResultItem := videoResult.Items[searchResultIndex]
-		likes, err := strconv.ParseFloat(videoResultItem.Statistics.LikeCount, 32)
-		if err != nil {
-			log.Fatal(err)
+		var numLikes, numDislikes, likeRatio float32
+		if len(videoResultItem.Statistics.LikeCount) > 0 {
+			converted, err := strconv.ParseFloat(videoResultItem.Statistics.LikeCount, 32)
+			if err != nil {
+				log.Fatal(err)
+			}
+			numLikes = float32(converted)
 		}
-		dislikes, err := strconv.ParseFloat(videoResultItem.Statistics.DislikeCount, 32)
-		if err != nil {
-			log.Fatal(err)
+		if len(videoResultItem.Statistics.DislikeCount) > 0 {
+			converted, err := strconv.ParseFloat(videoResultItem.Statistics.DislikeCount, 32)
+			if err != nil {
+				log.Fatal(err)
+			}
+			numDislikes = float32(converted)
 		}
+
+		if numLikes > 0 || numDislikes > 0 {
+			likeRatio = numLikes / (numLikes + numDislikes)
+		} else {
+			likeRatio = -1
+		}
+
 		aggregated[searchResultItem.ID.VideoID] = VideoComplete{
 			searchResultItem.Snippet.Title,
 			searchResultItem.Snippet.Description,
 			searchResultItem.Snippet.ChannelTitle,
 			videoResultItem.ContentDetails.Duration,
 			videoResultItem.Statistics.ViewCount,
-			float32(likes / (likes + dislikes)),
+			likeRatio,
 		}
 	}
 
 	consoleOutput := "\n--SEARCH RESULTS--\n\n"
 	for index, elem := range searchResult.Items {
 		id := elem.ID.VideoID
-		consoleOutput += fmt.Sprintf("%d) %s (%s)\nChannel: %s\nViews: %s\nLikes: %.2f%%\n\n", index+1, elem.Snippet.Title, aggregated[id].Duration, elem.Snippet.ChannelTitle, aggregated[id].Views, aggregated[id].LikeRatio*100)
+		var likePrint string
+		if aggregated[id].LikeRatio == -1 {
+			likePrint = "Unavailable"
+		} else {
+			likePrint = fmt.Sprintf("%.2f%%", aggregated[id].LikeRatio*100)
+		}
+		consoleOutput += fmt.Sprintf("%d) %s (%s)\nChannel: %s\nViews: %s\nLikes: %s\n\n", index+1, elem.Snippet.Title, aggregated[id].Duration, elem.Snippet.ChannelTitle, aggregated[id].Views, likePrint)
 	}
 	fmt.Println(consoleOutput)
 	fmt.Print("Select a Video: ")
